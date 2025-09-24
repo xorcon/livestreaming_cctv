@@ -1,0 +1,184 @@
+%% CCTV GIS + WebRTC system diagrams
+
+%% Logical Flow
+flowchart TD
+  subgraph Client[Browser / User]
+    A[Leaflet Map + UI Filter (role)]
+    B[WebRTC Player (video only)]
+  end
+
+  subgraph API[API Backend (Node.js)]
+    C1[REST: /api/cameras?bbox&role]
+    C2[REST: /view-start & /view-end]
+    C3[WebSocket: status updates]
+    C4[GeoIP lookup (IP→Country)]
+    C5[Metrics Exporter (Prometheus)]
+  end
+
+  subgraph DB[Database]
+    D1[(PostgreSQL + PostGIS)]
+  end
+
+  subgraph Streaming[Streaming Layer]
+    E1[MediaMTX / go2rtc<br/>RTSP ingest hub]
+    E2[Janus Gateway (SFU)<br/>pass-through H.264]
+    E3[CoTURN (STUN/TURN)]
+  end
+
+  subgraph Cameras[CCTV Network]
+    F1[RTSP Sub-stream<br/>H.264 Main 640x480<br/>No Audio]
+  end
+
+  subgraph Monitoring[Monitoring]
+    G1[(Prometheus)]
+    G2[Grafana Dashboards]
+  end
+
+  A -- load list/markers --> C1
+  C1 --> D1
+  D1 --> C1
+  A -- click camera --> B
+  B -- start view --> C2
+  C2 --> C4
+  C2 --> C5
+  C5 --> G1
+  G1 --> G2
+
+  B <-- WebRTC (SRTP) --> E2
+  B --- ICE/NAT --- E3
+  E2 <-- RTP/H.264 copy --> E1
+  E1 <-- RTSP (pull) --> F1
+
+  C3 -. push status .- A
+  API <--> D1
+
+%% Sequence Diagram
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant FE as Frontend (Leaflet + Player)
+  participant API as API (Node.js)
+  participant GEO as GeoIP DB
+  participant MET as Metrics Exporter
+  participant JAN as Janus Gateway (SFU)
+  participant TURN as CoTURN
+  participant MTX as MediaMTX/go2rtc
+  participant CAM as CCTV (RTSP H.264 Main 640x480, no-audio)
+
+  U->>FE: เปิดเว็บ/ซูมแผนที่
+  FE->>API: GET /api/cameras?bbox&role
+  API->>DB: query cameras (PostGIS)
+  DB-->>API: list + last_status
+  API-->>FE: markers + meta
+
+  U->>FE: คลิกไอคอนกล้อง
+  FE->>API: POST /view-start {camera_id}
+  API->>GEO: IP → country
+  API->>MET: inc webrtc_view_start_total{camera_id,country,browser,os}
+  API-->>FE: {janus_url, iceServers (TURN), streamId}
+
+  FE->>JAN: สร้าง Janus session/handle (REST/WSS)
+  FE->>FE: createOffer (recvonly video)
+  FE->>JAN: SDP(offer)
+  JAN->>MTX: attach/ensure source for cameraId
+  MTX->>CAM: RTSP pull (H.264 Main, no-audio)
+  MTX-->>JAN: RTP/H.264 (copy)
+  JAN-->>FE: SDP(answer)
+
+  par ICE
+    FE-->>TURN: STUN/TURN (gathering)
+    FE-->>JAN: ICE candidates
+    JAN-->>FE: ICE candidates
+  end
+
+  FE-->>API: heartbeat (every 10s)
+  API->>MET: add webrtc_view_seconds_total += 10
+
+  Note over FE,JAN: วิดีโอเล่นแบบ pass-through H.264 (ไม่ re-encode)
+
+  U->>FE: ปิด player / เปลี่ยนหน้า
+  FE->>API: POST /view-end {camera_id}
+  API->>MET: dec webrtc_viewers_gauge{camera_id,country}
+  FE->>JAN: detach/cleanup
+
+%% Health & Metrics Flow
+flowchart LR
+  subgraph Worker[Health Checker (Cron/Worker)]
+    H1[RTSP probe (ffprobe/OPTIONS/DESCRIBE)]
+    H2[Update last_status, last_checked]
+  end
+  H1 --> H2
+  H2 --> DB[(PostgreSQL + PostGIS)]
+
+  subgraph Metrics[Usage Metrics]
+    M1[/view-start, heartbeat, /view-end/]
+    M2[Prometheus Exporter<br/>webrtc_view_start_total<br/>webrtc_viewers_gauge<br/>webrtc_view_seconds_total]
+    M3[(Prometheus TSDB)]
+    M4[Grafana]
+  end
+
+  FE2[Frontend] -- WS push --> FE2
+  API2[API] -->|status query| DB
+  FE2 -. subscribe .-> API2
+
+  API2 -->|emit events| M1
+  M1 --> M2 --> M3 --> M4
+
+%% Deployment Topology
+flowchart TB
+  subgraph Client Side
+    C1[Browsers / Mobile]
+  end
+
+  subgraph Edge[Edge / Ingress]
+    N1[Nginx/Ingress LB<br/>TLS, X-Forwarded-For]
+  end
+
+  subgraph App[App Layer (stateless)]
+    A1[API Pods (Node.js)]
+    A2[Metrics Exporter]
+    A3[WebSocket status]
+  end
+
+  subgraph Data[Data Layer]
+    D1[(PostgreSQL + PostGIS)]
+    D2[(Redis cache - optional)]
+  end
+
+  subgraph Stream[Streaming Cluster]
+    J1[Janus-1]
+    J2[Janus-2]
+    M1[MediaMTX-1]
+    M2[MediaMTX-2]
+    T1[CoTURN-1]
+    T2[CoTURN-2]
+  end
+
+  subgraph Mon[Monitoring]
+    P1[(Prometheus)]
+    G1[Grafana]
+  end
+
+  subgraph CamNet[CCTV Network VLAN]
+    K1[RTSP Cameras\\nH.264 Main 640x480 no-audio]
+  end
+
+  C1 --> N1
+  N1 --> A1
+  N1 --> J1
+  N1 --> J2
+  A1 --> D1
+  A1 --> D2
+  A1 --> A2
+  A2 --> P1
+  P1 --> G1
+
+  C1 --- T1
+  C1 --- T2
+  J1 --- T1
+  J2 --- T2
+
+  J1 <-- RTP/H.264 --> M1
+  J2 <-- RTP/H.264 --> M2
+  M1 <-- RTSP pull --> K1
+  M2 <-- RTSP pull --> K1
