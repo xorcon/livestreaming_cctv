@@ -1,184 +1,122 @@
-%% CCTV GIS + WebRTC system diagrams
-
-%% Logical Flow
-flowchart TD
-  subgraph Client[Browser / User]
-    A[Leaflet Map + UI Filter (role)]
-    B[WebRTC Player (video only)]
-  end
-
-  subgraph API[API Backend (Node.js)]
-    C1[REST: /api/cameras?bbox&role]
-    C2[REST: /view-start & /view-end]
-    C3[WebSocket: status updates]
-    C4[GeoIP lookup (IP→Country)]
-    C5[Metrics Exporter (Prometheus)]
-  end
-
-  subgraph DB[Database]
-    D1[(PostgreSQL + PostGIS)]
-  end
-
-  subgraph Streaming[Streaming Layer]
-    E1[MediaMTX / go2rtc<br/>RTSP ingest hub]
-    E2[Janus Gateway (SFU)<br/>pass-through H.264]
-    E3[CoTURN (STUN/TURN)]
-  end
-
-  subgraph Cameras[CCTV Network]
-    F1[RTSP Sub-stream<br/>H.264 Main 640x480<br/>No Audio]
-  end
-
-  subgraph Monitoring[Monitoring]
-    G1[(Prometheus)]
-    G2[Grafana Dashboards]
-  end
-
-  A -- load list/markers --> C1
-  C1 --> D1
-  D1 --> C1
-  A -- click camera --> B
-  B -- start view --> C2
-  C2 --> C4
-  C2 --> C5
-  C5 --> G1
-  G1 --> G2
-
-  B <-- WebRTC (SRTP) --> E2
-  B --- ICE/NAT --- E3
-  E2 <-- RTP/H.264 copy --> E1
-  E1 <-- RTSP (pull) --> F1
-
-  C3 -. push status .- A
-  API <--> D1
-
-%% Sequence Diagram
-sequenceDiagram
-  autonumber
-  participant U as User
-  participant FE as Frontend (Leaflet + Player)
-  participant API as API (Node.js)
-  participant GEO as GeoIP DB
-  participant MET as Metrics Exporter
-  participant JAN as Janus Gateway (SFU)
-  participant TURN as CoTURN
-  participant MTX as MediaMTX/go2rtc
-  participant CAM as CCTV (RTSP H.264 Main 640x480, no-audio)
-
-  U->>FE: เปิดเว็บ/ซูมแผนที่
-  FE->>API: GET /api/cameras?bbox&role
-  API->>DB: query cameras (PostGIS)
-  DB-->>API: list + last_status
-  API-->>FE: markers + meta
-
-  U->>FE: คลิกไอคอนกล้อง
-  FE->>API: POST /view-start {camera_id}
-  API->>GEO: IP → country
-  API->>MET: inc webrtc_view_start_total{camera_id,country,browser,os}
-  API-->>FE: {janus_url, iceServers (TURN), streamId}
-
-  FE->>JAN: สร้าง Janus session/handle (REST/WSS)
-  FE->>FE: createOffer (recvonly video)
-  FE->>JAN: SDP(offer)
-  JAN->>MTX: attach/ensure source for cameraId
-  MTX->>CAM: RTSP pull (H.264 Main, no-audio)
-  MTX-->>JAN: RTP/H.264 (copy)
-  JAN-->>FE: SDP(answer)
-
-  par ICE
-    FE-->>TURN: STUN/TURN (gathering)
-    FE-->>JAN: ICE candidates
-    JAN-->>FE: ICE candidates
-  end
-
-  FE-->>API: heartbeat (every 10s)
-  API->>MET: add webrtc_view_seconds_total += 10
-
-  Note over FE,JAN: วิดีโอเล่นแบบ pass-through H.264 (ไม่ re-encode)
-
-  U->>FE: ปิด player / เปลี่ยนหน้า
-  FE->>API: POST /view-end {camera_id}
-  API->>MET: dec webrtc_viewers_gauge{camera_id,country}
-  FE->>JAN: detach/cleanup
-
-%% Health & Metrics Flow
-flowchart LR
-  subgraph Worker[Health Checker (Cron/Worker)]
-    H1[RTSP probe (ffprobe/OPTIONS/DESCRIBE)]
-    H2[Update last_status, last_checked]
-  end
-  H1 --> H2
-  H2 --> DB[(PostgreSQL + PostGIS)]
-
-  subgraph Metrics[Usage Metrics]
-    M1[/view-start, heartbeat, /view-end/]
-    M2[Prometheus Exporter<br/>webrtc_view_start_total<br/>webrtc_viewers_gauge<br/>webrtc_view_seconds_total]
-    M3[(Prometheus TSDB)]
-    M4[Grafana]
-  end
-
-  FE2[Frontend] -- WS push --> FE2
-  API2[API] -->|status query| DB
-  FE2 -. subscribe .-> API2
-
-  API2 -->|emit events| M1
-  M1 --> M2 --> M3 --> M4
-
-%% Deployment Topology
 flowchart TB
-  subgraph Client Side
-    C1[Browsers / Mobile]
+  subgraph Internet[Internet Users]
+    USERS[Web Browsers<br/>Desktop & Mobile<br/>WebRTC supported]
   end
 
-  subgraph Edge[Edge / Ingress]
-    N1[Nginx/Ingress LB<br/>TLS, X-Forwarded-For]
+  subgraph EdgeInfrastructure[Edge & Load Balancing Layer]
+    CDN[Content Delivery Network<br/>CloudFlare / AWS CloudFront<br/>Static assets & edge caching]
+    LB[Load Balancer<br/>Nginx / HAProxy<br/>SSL termination + health checks]
+    SSL[TLS Certificates<br/>Let's Encrypt auto-renewal<br/>HTTP/2 & HTTP/3 support]
   end
 
-  subgraph App[App Layer (stateless)]
-    A1[API Pods (Node.js)]
-    A2[Metrics Exporter]
-    A3[WebSocket status]
+  subgraph ApplicationTier[Application Services - Kubernetes Cluster]
+    API1[API Server Pod 1<br/>Node.js + Express<br/>Horizontal Pod Autoscaler]
+    API2[API Server Pod 2<br/>Node.js + Express<br/>Resource limits: 1CPU/2GB]
+    API3[API Server Pod N<br/>Node.js + Express<br/>Rolling deployment strategy]
+    
+    WS1[WebSocket Service<br/>Socket.io cluster adapter<br/>Redis pub/sub for scaling]
+    
+    WORKER[Background Workers:<br/>• Health check cron jobs<br/>• Session cleanup tasks<br/>• Metrics aggregation]
+    
+    METRICS[Metrics Exporter<br/>Prometheus client<br/>/metrics endpoint exposed]
   end
 
-  subgraph Data[Data Layer]
-    D1[(PostgreSQL + PostGIS)]
-    D2[(Redis cache - optional)]
+  subgraph StreamingInfrastructure[WebRTC Streaming Cluster]
+    JANUS1[Janus Gateway Instance 1<br/>SFU mode configuration<br/>VideoRoom plugin enabled<br/>4CPU/8GB RAM recommended]
+    
+    JANUS2[Janus Gateway Instance 2<br/>Load balanced with instance 1<br/>Shared session state in Redis<br/>Auto-scaling based on connections]
+    
+    MTX1[MediaMTX Instance 1<br/>RTSP ingestion server<br/>H.264 passthrough mode<br/>Connection pooling enabled]
+    
+    MTX2[MediaMTX Instance 2<br/>Redundant RTSP ingestion<br/>Failover configuration<br/>Health monitoring integrated]
+    
+    TURN1[CoTURN Server 1<br/>STUN/TURN relay service<br/>UDP/TCP/TLS support<br/>Geographic distribution]
+    
+    TURN2[CoTURN Server 2<br/>High availability pair<br/>Shared secret rotation<br/>Rate limiting configured]
   end
 
-  subgraph Stream[Streaming Cluster]
-    J1[Janus-1]
-    J2[Janus-2]
-    M1[MediaMTX-1]
-    M2[MediaMTX-2]
-    T1[CoTURN-1]
-    T2[CoTURN-2]
+  subgraph DataPersistence[Database & Cache Layer]
+    PGMASTER[(PostgreSQL Primary<br/>PostGIS extension installed<br/>Synchronous replication<br/>Automated backups)]
+    
+    PGREPLICA[(PostgreSQL Read Replica<br/>Read-only queries<br/>Connection pooling<br/>Failover ready)]
+    
+    REDIS[(Redis Cluster<br/>Session storage<br/>WebSocket scaling<br/>Cache layer<br/>3 master + 3 replica)]
   end
 
-  subgraph Mon[Monitoring]
-    P1[(Prometheus)]
-    G1[Grafana]
+  subgraph ObservabilityStack[Monitoring & Observability]
+    PROMETHEUS[(Prometheus Server<br/>Metrics collection<br/>Alert rule evaluation<br/>Data retention: 30 days)]
+    
+    GRAFANA[Grafana Instance<br/>Dashboard visualization<br/>Real-time monitoring<br/>User access control]
+    
+    ALERTMANAGER[AlertManager<br/>Alert routing & grouping<br/>Notification channels<br/>Silence management]
+    
+    LOGS[Centralized Logging<br/>ELK Stack / Grafana Loki<br/>Log aggregation<br/>Search & analysis]
   end
 
-  subgraph CamNet[CCTV Network VLAN]
-    K1[RTSP Cameras\\nH.264 Main 640x480 no-audio]
+  subgraph CameraInfrastructure[CCTV Network Infrastructure]
+    CAMERAVLAN[Private Camera VLAN<br/>Network: 192.168.100.0/24<br/>Isolated from public internet<br/>Firewall rules applied]
+    
+    CAMERA1[IP Camera 1<br/>RTSP: rtsp://192.168.100.101/stream<br/>Codec: H.264 Main Profile<br/>Resolution: 640x480<br/>Framerate: 15fps<br/>Audio: Disabled]
+    
+    CAMERA2[IP Camera 2<br/>RTSP: rtsp://192.168.100.102/stream<br/>Same specifications<br/>Power over Ethernet]
+    
+    CAMERAN[IP Camera N<br/>RTSP: rtsp://192.168.100.1XX/stream<br/>Scalable up to 254 cameras<br/>Network monitoring enabled]
   end
 
-  C1 --> N1
-  N1 --> A1
-  N1 --> J1
-  N1 --> J2
-  A1 --> D1
-  A1 --> D2
-  A1 --> A2
-  A2 --> P1
-  P1 --> G1
+  %% External traffic flow
+  USERS -->|HTTPS requests| CDN
+  CDN -->|Cache miss/dynamic content| SSL
+  SSL --> LB
+  LB -->|Round-robin distribution| API1
+  LB -->|Health check routing| API2
+  LB -->|Load balancing| API3
+  LB -->|WebSocket upgrade| WS1
 
-  C1 --- T1
-  C1 --- T2
-  J1 --- T1
-  J2 --- T2
+  %% Direct WebRTC connections bypass load balancer
+  USERS -.->|WebRTC signaling| JANUS1
+  USERS -.->|WebRTC signaling| JANUS2
+  USERS -.->|STUN/TURN requests| TURN1
+  USERS -.->|STUN/TURN requests| TURN2
 
-  J1 <-- RTP/H.264 --> M1
-  J2 <-- RTP/H.264 --> M2
-  M1 <-- RTSP pull --> K1
-  M2 <-- RTSP pull --> K1
+  %% Application to database connections
+  API1 <-->|Read/Write operations| PGMASTER
+  API2 <-->|Read operations| PGREPLICA
+  API3 <-->|Session management| REDIS
+  WS1 <-->|Pub/Sub messaging| REDIS
+
+  %% Streaming infrastructure connections
+  JANUS1 <-->|RTP/H.264 forwarding| MTX1
+  JANUS2 <-->|RTP/H.264 forwarding| MTX2
+  JANUS1 -.->|ICE candidate relay| TURN1
+  JANUS2 -.->|ICE candidate relay| TURN2
+
+  %% Camera network connections
+  MTX1 <-->|RTSP pull ingestion| CAMERAVLAN
+  MTX2 <-->|Redundant RTSP pull| CAMERAVLAN
+  CAMERAVLAN --- CAMERA1
+  CAMERAVLAN --- CAMERA2
+  CAMERAVLAN --- CAMERAN
+
+  %% Monitoring and observability
+  METRICS -->|Metrics scraping| PROMETHEUS
+  PROMETHEUS -->|Dashboard data| GRAFANA
+  PROMETHEUS -->|Alert evaluation| ALERTMANAGER
+  
+  API1 -.->|Application logs| LOGS
+  JANUS1 -.->|WebRTC logs| LOGS
+  MTX1 -.->|Streaming logs| LOGS
+
+  %% High availability and replication
+  PGMASTER -.->|Streaming replication| PGREPLICA
+  REDIS -.->|Cluster replication| REDIS
+
+  %% Configuration notes
+  classDef database fill:#e1f5fe
+  classDef streaming fill:#f3e5f5
+  classDef monitoring fill:#e8f5e8
+  classDef camera fill:#fff3e0
+  
+  class PGMASTER,PGREPLICA,REDIS database
+  class JANUS1,JANUS2,MTX1,MTX2,TURN1,TURN2 streaming
+  class PROMETHEUS,GRAFANA,ALERTMANAGER,LOGS monitoring
+  class CAMERAVLAN,CAMERA1,CAMERA2,CAMERAN camera
