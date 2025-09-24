@@ -1,7 +1,0 @@
-node_modules/
-.env
-*.log
-tmp/
-.DS_Store
-dist/
-npm-debug.log*
